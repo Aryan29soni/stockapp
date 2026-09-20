@@ -1,3 +1,4 @@
+import asyncio
 import logging
 
 from dotenv import load_dotenv
@@ -44,6 +45,42 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Render's free tier is ~512MB with a fraction of one CPU. predict.py's
+# _TRAINING_LOCK bounds concurrent ML training, and timeouts.py bounds how
+# long any single yfinance call can hang, but neither stops several
+# DIFFERENT heavy requests (a few stocks' 5y history downloads, a news scan
+# across 150 symbols, a forecast) from simply running at the same time and
+# adding up to more memory than the instance has - confirmed by testing this
+# directly: 3 concurrent /predict calls plus a /news call was enough to
+# crash the instance even with both of those fixes in place. This caps how
+# many requests the whole app processes at once; anything beyond that queues
+# briefly, then fails fast with a 503 rather than piling on and taking the
+# whole instance down for everyone.
+_MAX_CONCURRENT_REQUESTS = 4
+_CONCURRENCY_QUEUE_TIMEOUT_SECONDS = 20
+_REQUEST_SEMAPHORE = asyncio.Semaphore(_MAX_CONCURRENT_REQUESTS)
+
+
+@app.middleware("http")
+async def limit_concurrency(request: Request, call_next):
+    # Render's own liveness probe hits /health constantly - it must never be
+    # queued behind heavy requests, or Render can conclude the instance
+    # itself is unhealthy and restart it, which defeats the point of this
+    # limiter.
+    if request.url.path == "/health":
+        return await call_next(request)
+    try:
+        await asyncio.wait_for(_REQUEST_SEMAPHORE.acquire(), timeout=_CONCURRENCY_QUEUE_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "Server is busy right now. Please try again in a moment."},
+        )
+    try:
+        return await call_next(request)
+    finally:
+        _REQUEST_SEMAPHORE.release()
 
 
 @app.exception_handler(DataProviderTimeout)
