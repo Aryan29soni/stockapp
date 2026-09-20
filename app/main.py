@@ -26,7 +26,14 @@ class _SuppressLogo404(logging.Filter):
 logging.getLogger("uvicorn.access").addFilter(_SuppressLogo404())
 
 from . import auth, compare, data, indicators, logos, macro, news, predict, signals, social, stocks  # noqa: E402
-from .db import User, WatchlistItem, get_db, init_db  # noqa: E402
+from .db import (  # noqa: E402
+    PortfolioHolding,
+    PortfolioTransaction,
+    User,
+    WatchlistItem,
+    get_db,
+    init_db,
+)
 
 app = FastAPI(title="Indian Stock Analysis & Prediction API", version="0.1.0")
 
@@ -60,6 +67,15 @@ class SymbolRequest(BaseModel):
 
 class MergeWatchlistRequest(BaseModel):
     symbols: list[str] = Field(default_factory=list)
+
+
+class DepositRequest(BaseModel):
+    amount: float = Field(gt=0, le=100_000_000)
+
+
+class TradeRequest(BaseModel):
+    symbol: str
+    quantity: int = Field(gt=0)
 
 
 def _user_payload(user: User) -> dict:
@@ -158,6 +174,158 @@ def merge_watchlist(
             existing.add(upper)
     db.commit()
     return {"symbols": sorted(existing)}
+
+
+def _holding_payload(holding: PortfolioHolding, exchange: str = "NSE") -> dict:
+    try:
+        current_price = data.get_quote(holding.symbol, exchange=exchange)["price"]
+    except ValueError:
+        current_price = None
+    cost_basis = holding.quantity * holding.avg_buy_price
+    market_value = holding.quantity * current_price if current_price is not None else None
+    unrealized_pnl = market_value - cost_basis if market_value is not None else None
+    unrealized_pnl_percent = (
+        (unrealized_pnl / cost_basis * 100) if unrealized_pnl is not None and cost_basis > 0 else None
+    )
+    return {
+        "symbol": holding.symbol,
+        "quantity": holding.quantity,
+        "avgBuyPrice": round(holding.avg_buy_price, 2),
+        "currentPrice": round(current_price, 2) if current_price is not None else None,
+        "costBasis": round(cost_basis, 2),
+        "marketValue": round(market_value, 2) if market_value is not None else None,
+        "unrealizedPnl": round(unrealized_pnl, 2) if unrealized_pnl is not None else None,
+        "unrealizedPnlPercent": round(unrealized_pnl_percent, 2) if unrealized_pnl_percent is not None else None,
+    }
+
+
+def _transaction_payload(tx: PortfolioTransaction) -> dict:
+    return {
+        "id": tx.id,
+        "type": tx.type,
+        "symbol": tx.symbol,
+        "quantity": tx.quantity,
+        "pricePerShare": round(tx.price_per_share, 2) if tx.price_per_share is not None else None,
+        "amount": round(tx.amount, 2),
+        "createdAt": tx.created_at.isoformat() if tx.created_at else None,
+    }
+
+
+@app.get("/portfolio")
+def get_portfolio(
+    exchange: str = Query("NSE", pattern="^(NSE|BSE)$"),
+    user: User = Depends(auth.get_current_user),
+    db: Session = Depends(get_db),
+):
+    holdings = db.scalars(
+        select(PortfolioHolding).where(PortfolioHolding.user_id == user.id, PortfolioHolding.quantity > 0)
+    ).all()
+    holding_payloads = [_holding_payload(h, exchange) for h in holdings]
+    holdings_value = sum(h["marketValue"] for h in holding_payloads if h["marketValue"] is not None)
+    transactions = db.scalars(
+        select(PortfolioTransaction)
+        .where(PortfolioTransaction.user_id == user.id)
+        .order_by(PortfolioTransaction.created_at.desc())
+        .limit(50)
+    ).all()
+    return {
+        "cashBalance": round(user.paper_cash_balance, 2),
+        "holdingsValue": round(holdings_value, 2),
+        "totalValue": round(user.paper_cash_balance + holdings_value, 2),
+        "holdings": holding_payloads,
+        "transactions": [_transaction_payload(t) for t in transactions],
+    }
+
+
+@app.post("/portfolio/deposit")
+def deposit_funds(
+    body: DepositRequest, user: User = Depends(auth.get_current_user), db: Session = Depends(get_db)
+):
+    """Dummy fund source - no payment processor, no real money. Adds
+    straight to the user's paper_cash_balance so the forecast/signal
+    features can be tested with a simulated portfolio."""
+    user.paper_cash_balance += body.amount
+    db.add(PortfolioTransaction(user_id=user.id, type="DEPOSIT", amount=body.amount))
+    db.commit()
+    return {"cashBalance": round(user.paper_cash_balance, 2)}
+
+
+@app.post("/portfolio/buy")
+def buy_stock(
+    body: TradeRequest,
+    exchange: str = Query("NSE", pattern="^(NSE|BSE)$"),
+    user: User = Depends(auth.get_current_user),
+    db: Session = Depends(get_db),
+):
+    symbol = body.symbol.strip().upper()
+    try:
+        price = data.get_quote(symbol, exchange=exchange)["price"]
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    total_cost = price * body.quantity
+    if total_cost > user.paper_cash_balance:
+        raise HTTPException(status_code=400, detail="Not enough virtual cash for this trade.")
+
+    holding = db.scalar(
+        select(PortfolioHolding).where(PortfolioHolding.user_id == user.id, PortfolioHolding.symbol == symbol)
+    )
+    if holding and holding.quantity > 0:
+        new_quantity = holding.quantity + body.quantity
+        holding.avg_buy_price = (
+            holding.avg_buy_price * holding.quantity + price * body.quantity
+        ) / new_quantity
+        holding.quantity = new_quantity
+    elif holding:
+        holding.quantity = body.quantity
+        holding.avg_buy_price = price
+    else:
+        holding = PortfolioHolding(
+            user_id=user.id, symbol=symbol, quantity=body.quantity, avg_buy_price=price
+        )
+        db.add(holding)
+
+    user.paper_cash_balance -= total_cost
+    db.add(
+        PortfolioTransaction(
+            user_id=user.id, type="BUY", symbol=symbol, quantity=body.quantity,
+            price_per_share=price, amount=-total_cost,
+        )
+    )
+    db.commit()
+    return {"cashBalance": round(user.paper_cash_balance, 2), "holding": _holding_payload(holding, exchange)}
+
+
+@app.post("/portfolio/sell")
+def sell_stock(
+    body: TradeRequest,
+    exchange: str = Query("NSE", pattern="^(NSE|BSE)$"),
+    user: User = Depends(auth.get_current_user),
+    db: Session = Depends(get_db),
+):
+    symbol = body.symbol.strip().upper()
+    holding = db.scalar(
+        select(PortfolioHolding).where(PortfolioHolding.user_id == user.id, PortfolioHolding.symbol == symbol)
+    )
+    if not holding or holding.quantity < body.quantity:
+        raise HTTPException(status_code=400, detail="Not enough shares held to sell that quantity.")
+
+    try:
+        price = data.get_quote(symbol, exchange=exchange)["price"]
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    proceeds = price * body.quantity
+    holding.quantity -= body.quantity
+    user.paper_cash_balance += proceeds
+    db.add(
+        PortfolioTransaction(
+            user_id=user.id, type="SELL", symbol=symbol, quantity=body.quantity,
+            price_per_share=price, amount=proceeds,
+        )
+    )
+    db.commit()
+    return {"cashBalance": round(user.paper_cash_balance, 2), "holding": _holding_payload(holding, exchange)}
 
 
 @app.get("/health")
