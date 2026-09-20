@@ -1,0 +1,15 @@
+fastapi
+uvicorn[standard]
+yfinance
+pandas
+numpy
+scikit-learn
+pydantic
+vaderSentiment
+requests
+python-dotenv
+sqlalchemy
+psycopg2-binary
+bcrypt
+pyjwt
+beautifulsoup4
