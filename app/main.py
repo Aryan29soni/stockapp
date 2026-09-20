@@ -44,13 +44,14 @@ app = FastAPI(title="Indian Stock Analysis & Prediction API", version="0.1.0")
 # long any single yfinance call can hang, but neither stops several
 # DIFFERENT heavy requests (a few stocks' 5y history downloads, a news scan
 # across 150 symbols, a forecast) from simply running at the same time and
-# adding up to more memory than the instance has - confirmed by testing this
-# directly: 3 concurrent /predict calls plus a /news call was enough to
-# crash the instance even with both of those fixes in place. This caps how
-# many requests the whole app processes at once; anything beyond that queues
-# briefly, then fails fast with a 503 rather than piling on and taking the
-# whole instance down for everyone.
-_MAX_CONCURRENT_REQUESTS = 4
+# adding up to more memory than the instance has. Confirmed directly by
+# testing: even with both of those fixes in place, 4 concurrent /predict
+# calls alone (each downloading its own 5y history before ever reaching the
+# training lock) was enough to crash the instance - so 4 was still too
+# generous. 2 is deliberately conservative given how little headroom this
+# tier has; anything beyond that queues briefly, then fails fast with a 503
+# rather than piling on and taking the whole instance down for everyone.
+_MAX_CONCURRENT_REQUESTS = 2
 _CONCURRENCY_QUEUE_TIMEOUT_SECONDS = 20
 _REQUEST_SEMAPHORE = asyncio.Semaphore(_MAX_CONCURRENT_REQUESTS)
 
