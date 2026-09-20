@@ -4,6 +4,7 @@ import pandas as pd
 import yfinance as yf
 
 from .cache import TTLCache
+from .timeouts import call_with_timeout
 
 # max_entries bounds: with 1,400+ NSE symbols x several history periods,
 # an unbounded cache here is what was actually OOM-killing the backend on
@@ -27,7 +28,7 @@ def get_history(symbol: str, period: str = "6mo", exchange: str = "NSE") -> pd.D
         return cached.copy()
 
     ticker = yf.Ticker(_yf_symbol(symbol, exchange))
-    df = ticker.history(period=period, auto_adjust=True)
+    df = call_with_timeout(ticker.history, period=period, auto_adjust=True, timeout=15)
     if df.empty:
         raise ValueError(f"No data found for symbol '{symbol}' on {exchange}")
 
@@ -47,10 +48,23 @@ def get_index_history(period: str = "2y", exchange: str = "NSE") -> pd.DataFrame
         return cached.copy()
 
     ticker = yf.Ticker(_INDEX_TICKERS.get(exchange.upper(), "^NSEI"))
-    df = ticker.history(period=period, auto_adjust=True)
+    df = call_with_timeout(ticker.history, period=period, auto_adjust=True, timeout=15)
     df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
     _HISTORY_CACHE.set(cache_key, df)
     return df.copy()
+
+
+def _fetch_fast_info(ticker: "yf.Ticker") -> dict:
+    """Plain-dict snapshot of fast_info - a real function (not a property
+    access) so it can be handed to call_with_timeout as a single callable."""
+    info = ticker.fast_info
+    return {
+        "price": float(info["lastPrice"]),
+        "prevClose": float(info["previousClose"]),
+        "dayHigh": float(info["dayHigh"]),
+        "dayLow": float(info["dayLow"]),
+        "volume": int(info["lastVolume"]),
+    }
 
 
 def get_quote(symbol: str, exchange: str = "NSE") -> dict:
@@ -62,12 +76,12 @@ def get_quote(symbol: str, exchange: str = "NSE") -> dict:
 
     ticker = yf.Ticker(_yf_symbol(symbol, exchange))
     try:
-        info = ticker.fast_info
-        price = float(info["lastPrice"])
-        prev_close = float(info["previousClose"])
-        day_high = float(info["dayHigh"])
-        day_low = float(info["dayLow"])
-        volume = int(info["lastVolume"])
+        fast = call_with_timeout(_fetch_fast_info, ticker, timeout=8)
+        price = fast["price"]
+        prev_close = fast["prevClose"]
+        day_high = fast["dayHigh"]
+        day_low = fast["dayLow"]
+        volume = fast["volume"]
     except (KeyError, TypeError, ValueError):
         # Fallback for symbols fast_info doesn't cover well
         df = get_history(symbol, period="5d", exchange=exchange)
@@ -106,9 +120,9 @@ def _bulk_fetch_quotes(symbols: list[str], exchange: str) -> dict[str, dict]:
         return {}
 
     yf_symbols = [_yf_symbol(s, exchange) for s in symbols]
-    df = yf.download(
-        yf_symbols, period="5d", group_by="ticker", threads=True,
-        progress=False, auto_adjust=True,
+    df = call_with_timeout(
+        yf.download, yf_symbols, period="5d", group_by="ticker", threads=True,
+        progress=False, auto_adjust=True, timeout=20,
     )
     now_str = pd.Timestamp.now(tz="Asia/Kolkata").strftime("%Y-%m-%d %H:%M:%S")
 

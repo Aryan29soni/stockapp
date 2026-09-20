@@ -18,6 +18,7 @@ import pandas as pd
 import yfinance as yf
 
 from .cache import TTLCache
+from .timeouts import call_with_timeout
 
 # these move slowly; no need to refetch often. Low cardinality (a handful
 # of macro/sector tickers total) so size isn't a real growth risk here,
@@ -43,7 +44,7 @@ _SECTOR_INDEX_TICKERS = {
 
 def _fetch_series(ticker: str, period: str) -> pd.Series | None:
     try:
-        df = yf.Ticker(ticker).history(period=period, auto_adjust=True)
+        df = call_with_timeout(yf.Ticker(ticker).history, period=period, auto_adjust=True, timeout=10)
         if df.empty:
             return None
         return df["Close"]

@@ -10,6 +10,7 @@ import yfinance as yf
 from . import indicators as ind
 from .cache import TTLCache
 from .data import _yf_symbol  # reuse the same .NS/.BO suffix logic
+from .timeouts import DataProviderTimeout, call_with_timeout
 
 # signals only move once per trading day; bounded to 1,500 since every
 # distinct symbol viewed (there are 1,400+ NSE stocks) adds a key (see cache.py).
@@ -44,15 +45,28 @@ def get_bulk_signals(symbols: list[str], exchange: str = "NSE") -> dict[str, dic
         yf_symbols = [_yf_symbol(s, exchange) for s in need_fetch]
         chunks = [yf_symbols[i : i + _CHUNK_SIZE] for i in range(0, len(yf_symbols), _CHUNK_SIZE)]
 
+        # A hung chunk (Yahoo slow/rate-limiting) must not take the whole
+        # bulk request down with it - skip that chunk's symbols rather than
+        # blocking every caller of /signals or /news behind it (see
+        # timeouts.py).
+        def _fetch_chunk_safe(chunk: list[str]) -> pd.DataFrame | None:
+            try:
+                return call_with_timeout(_download_chunk, chunk, timeout=20)
+            except DataProviderTimeout:
+                return None
+
         if len(chunks) == 1:
-            dfs = [_download_chunk(chunks[0])]
+            dfs = [_fetch_chunk_safe(chunks[0])]
         else:
             with ThreadPoolExecutor(max_workers=len(chunks)) as pool:
-                dfs = list(pool.map(_download_chunk, chunks))
+                dfs = list(pool.map(_fetch_chunk_safe, chunks))
 
-        # Map each symbol to whichever chunk's dataframe it belongs to.
+        # Map each symbol to whichever chunk's dataframe it belongs to (chunks
+        # that timed out are simply absent, so those symbols get skipped below).
         symbol_to_df: dict[str, pd.DataFrame] = {}
         for chunk, df in zip(chunks, dfs):
+            if df is None:
+                continue
             for yf_symbol in chunk:
                 symbol_to_df[yf_symbol] = df
 

@@ -32,6 +32,7 @@ from . import signals as signals_module
 from . import stocks as stocks_module
 from .cache import TTLCache
 from .data import _yf_symbol
+from .timeouts import call_with_timeout
 
 DISCLAIMER = (
     "Sentiment blends a finance-tuned keyword lexicon (with negation "
@@ -77,9 +78,13 @@ def _combine(news_lean: str, technical_signal: str | None) -> tuple[str, str, st
     return "HOLD", "LOW", "No strong signal from either news tone or technicals."
 
 
+def _fetch_news_list(ticker: "yf.Ticker") -> list[dict]:
+    return ticker.news or []
+
+
 def _fetch_one(symbol: str, exchange: str) -> tuple[str, list[dict]]:
     try:
-        raw = yf.Ticker(_yf_symbol(symbol, exchange)).news or []
+        raw = call_with_timeout(_fetch_news_list, yf.Ticker(_yf_symbol(symbol, exchange)), timeout=10)
     except Exception:
         return symbol, []
     return symbol, raw

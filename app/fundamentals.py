@@ -18,6 +18,7 @@ import yfinance as yf
 
 from .cache import TTLCache
 from .data import _yf_symbol
+from .timeouts import call_with_timeout
 
 # reported quarterly, so no need to refetch often. "No earnings data found"
 # is itself cached as None (see cache.py's TTLCache.has()) so a symbol with
@@ -27,7 +28,8 @@ _CACHE: TTLCache[pd.DataFrame | None] = TTLCache(ttl_seconds=60 * 60 * 6, max_en
 
 def _fetch_earnings_dates(symbol: str, exchange: str) -> pd.DataFrame | None:
     try:
-        raw = yf.Ticker(_yf_symbol(symbol, exchange)).get_earnings_dates(limit=20)
+        ticker = yf.Ticker(_yf_symbol(symbol, exchange))
+        raw = call_with_timeout(ticker.get_earnings_dates, limit=20, timeout=10)
     except Exception:
         return None
     if raw is None or raw.empty:

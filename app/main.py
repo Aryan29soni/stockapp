@@ -1,9 +1,9 @@
 import logging
 
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import delete, select
 from sqlalchemy.exc import IntegrityError
@@ -34,6 +34,7 @@ from .db import (  # noqa: E402
     get_db,
     init_db,
 )
+from .timeouts import DataProviderTimeout  # noqa: E402
 
 app = FastAPI(title="Indian Stock Analysis & Prediction API", version="0.1.0")
 
@@ -43,6 +44,19 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.exception_handler(DataProviderTimeout)
+async def data_provider_timeout_handler(request: Request, exc: DataProviderTimeout) -> JSONResponse:
+    # Catches a slow/rate-limiting Yahoo Finance response for every endpoint
+    # in one place, rather than every route needing its own try/except - see
+    # timeouts.py for why this matters (a hung yfinance call used to be able
+    # to take the whole backend down, not just fail one request).
+    return JSONResponse(
+        status_code=503,
+        content={"detail": "Market data provider is responding slowly right now. Please try again in a moment."},
+    )
+
 
 init_db()
 
