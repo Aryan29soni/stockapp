@@ -39,13 +39,6 @@ from .timeouts import DataProviderTimeout  # noqa: E402
 
 app = FastAPI(title="Indian Stock Analysis & Prediction API", version="0.1.0")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
 # Render's free tier is ~512MB with a fraction of one CPU. predict.py's
 # _TRAINING_LOCK bounds concurrent ML training, and timeouts.py bounds how
 # long any single yfinance call can hang, but neither stops several
@@ -81,6 +74,22 @@ async def limit_concurrency(request: Request, call_next):
         return await call_next(request)
     finally:
         _REQUEST_SEMAPHORE.release()
+
+
+# Registered AFTER limit_concurrency (and must stay that way): Starlette
+# wraps middleware in reverse-registration order, so whichever is added LAST
+# ends up OUTERMOST. CORS needs to be outermost so it can attach headers to
+# every response, including limit_concurrency's own 503 short-circuit that
+# never reaches the route/CORS layer otherwise - confirmed live in
+# production, where that 503 came back with no CORS header at all and the
+# browser reported it as an opaque "CORS policy" failure instead of a
+# readable 503, defeating the whole point of returning a clean error.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.exception_handler(DataProviderTimeout)
