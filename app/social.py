@@ -70,6 +70,7 @@ from bs4 import BeautifulSoup
 
 from . import sentiment as sentiment_module
 from . import stocks as stocks_module
+from .cache import TTLCache
 
 DISCLAIMER = (
     "Mention counts and sentiment are pulled from whichever of Reddit, "
@@ -107,8 +108,10 @@ _YOUTUBE_EXTRA_CHANNEL_IDS = {"ETNow": "UCI_mwTKUhicNzFrhm33MzBQ"}
 _VIDEOS_PER_CHANNEL = 3
 _COMMENTS_PER_VIDEO = 50
 
-_CACHE_TTL_SECONDS = 60 * 30  # discussion volume moves slowly enough that 30min is fine
-_cache: dict[str, tuple[float, dict]] = {}
+# discussion volume moves slowly enough that 30min is fine. Only one real
+# key ("trending") so size isn't a growth risk, but using the shared cache
+# (see cache.py) for consistency.
+_cache: TTLCache[dict] = TTLCache(ttl_seconds=60 * 30, max_entries=10)
 
 _MENTION_STOPLIST = {"ACE", "IDEA", "RAIN", "SAIL", "STAR"}
 
@@ -417,10 +420,9 @@ def _fetch_telegram_items() -> list[dict]:
 
 def get_trending(limit: int = 20) -> dict:
     cache_key = "trending"
-    now = time.time()
     cached = _cache.get(cache_key)
-    if cached and now - cached[0] < _CACHE_TTL_SECONDS:
-        return cached[1]
+    if cached is not None:
+        return cached
 
     sources_configured = []
     all_items: list[dict] = []
@@ -476,5 +478,5 @@ def get_trending(limit: int = 20) -> dict:
         "disclaimer": DISCLAIMER,
         "generatedAt": generated_at,
     }
-    _cache[cache_key] = (now, payload)
+    _cache.set(cache_key, payload)
     return payload

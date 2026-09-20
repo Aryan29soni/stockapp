@@ -68,7 +68,15 @@ def verify_password(password: str, password_hash: str) -> bool:
 def check_rate_limit(username: str) -> None:
     now = time.time()
     attempts = [t for t in _LOGIN_ATTEMPTS.get(username, []) if now - t < _RATE_LIMIT_WINDOW_SECONDS]
-    _LOGIN_ATTEMPTS[username] = attempts
+    # Drop the key entirely once nothing's left, rather than leaving a
+    # permanent empty-list entry - every distinct username ever tried
+    # (including bot-probing junk usernames) would otherwise sit in memory
+    # forever, the same unbounded-growth shape as this backend's other
+    # never-evicted caches (see cache.py).
+    if attempts:
+        _LOGIN_ATTEMPTS[username] = attempts
+    else:
+        _LOGIN_ATTEMPTS.pop(username, None)
     if len(attempts) >= _RATE_LIMIT_MAX_ATTEMPTS:
         raise HTTPException(status_code=429, detail="Too many failed login attempts. Try again in 15 minutes.")
 

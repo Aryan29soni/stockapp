@@ -1,15 +1,17 @@
 """Fetches OHLCV data and live-ish quotes for Indian (NSE/BSE) tickers via yfinance."""
 
-import time
-
 import pandas as pd
 import yfinance as yf
 
-_HISTORY_CACHE: dict[str, tuple[float, pd.DataFrame]] = {}
-_HISTORY_CACHE_TTL_SECONDS = 60 * 5  # daily candles don't change intraday
+from .cache import TTLCache
 
-_QUOTE_CACHE: dict[str, tuple[float, dict]] = {}
-_QUOTE_CACHE_TTL_SECONDS = 10  # short TTL so repeated polling still feels "live"
+# max_entries bounds: with 1,400+ NSE symbols x several history periods,
+# an unbounded cache here is what was actually OOM-killing the backend on
+# Render's free 512MB tier - see cache.py. 300 history entries (full
+# DataFrames) and 1500 quotes (small dicts) comfortably covers a full
+# session's worth of browsing without growing forever.
+_HISTORY_CACHE: TTLCache[pd.DataFrame] = TTLCache(ttl_seconds=60 * 5, max_entries=300)
+_QUOTE_CACHE: TTLCache[dict] = TTLCache(ttl_seconds=10, max_entries=1500)
 
 
 def _yf_symbol(symbol: str, exchange: str = "NSE") -> str:
@@ -20,11 +22,9 @@ def _yf_symbol(symbol: str, exchange: str = "NSE") -> str:
 def get_history(symbol: str, period: str = "6mo", exchange: str = "NSE") -> pd.DataFrame:
     """Returns a DataFrame indexed by date with columns Open/High/Low/Close/Volume."""
     cache_key = f"{symbol}:{period}:{exchange}"
-    now = time.time()
-    if cache_key in _HISTORY_CACHE:
-        cached_at, df = _HISTORY_CACHE[cache_key]
-        if now - cached_at < _HISTORY_CACHE_TTL_SECONDS:
-            return df.copy()
+    cached = _HISTORY_CACHE.get(cache_key)
+    if cached is not None:
+        return cached.copy()
 
     ticker = yf.Ticker(_yf_symbol(symbol, exchange))
     df = ticker.history(period=period, auto_adjust=True)
@@ -32,7 +32,7 @@ def get_history(symbol: str, period: str = "6mo", exchange: str = "NSE") -> pd.D
         raise ValueError(f"No data found for symbol '{symbol}' on {exchange}")
 
     df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
-    _HISTORY_CACHE[cache_key] = (now, df)
+    _HISTORY_CACHE.set(cache_key, df)
     return df.copy()
 
 
@@ -42,27 +42,23 @@ _INDEX_TICKERS = {"NSE": "^NSEI", "BSE": "^BSESN"}  # Nifty 50 / Sensex
 def get_index_history(period: str = "2y", exchange: str = "NSE") -> pd.DataFrame:
     """Broad market index history, used as a relative-momentum feature for forecasts."""
     cache_key = f"INDEX:{exchange}:{period}"
-    now = time.time()
-    if cache_key in _HISTORY_CACHE:
-        cached_at, df = _HISTORY_CACHE[cache_key]
-        if now - cached_at < _HISTORY_CACHE_TTL_SECONDS:
-            return df.copy()
+    cached = _HISTORY_CACHE.get(cache_key)
+    if cached is not None:
+        return cached.copy()
 
     ticker = yf.Ticker(_INDEX_TICKERS.get(exchange.upper(), "^NSEI"))
     df = ticker.history(period=period, auto_adjust=True)
     df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
-    _HISTORY_CACHE[cache_key] = (now, df)
+    _HISTORY_CACHE.set(cache_key, df)
     return df.copy()
 
 
 def get_quote(symbol: str, exchange: str = "NSE") -> dict:
     """Live-ish quote via yfinance's lightweight fast_info (no full history download)."""
     cache_key = f"{symbol}:{exchange}"
-    now = time.time()
-    if cache_key in _QUOTE_CACHE:
-        cached_at, q = _QUOTE_CACHE[cache_key]
-        if now - cached_at < _QUOTE_CACHE_TTL_SECONDS:
-            return q
+    cached = _QUOTE_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
 
     ticker = yf.Ticker(_yf_symbol(symbol, exchange))
     try:
@@ -99,7 +95,7 @@ def get_quote(symbol: str, exchange: str = "NSE") -> dict:
         "volume": volume,
         "asOf": pd.Timestamp.now(tz="Asia/Kolkata").strftime("%Y-%m-%d %H:%M:%S"),
     }
-    _QUOTE_CACHE[cache_key] = (now, quote)
+    _QUOTE_CACHE.set(cache_key, quote)
     return quote
 
 
@@ -152,22 +148,20 @@ def _bulk_fetch_quotes(symbols: list[str], exchange: str) -> dict[str, dict]:
 def get_quotes(symbols: list[str], exchange: str = "NSE") -> list[dict]:
     """Fetch multiple live quotes, batching the network call and reusing the
     same short-lived cache as get_quote (for list/watchlist polling)."""
-    now = time.time()
     quotes: dict[str, dict] = {}
     need_fetch = []
 
     for symbol in symbols:
-        cache_key = f"{symbol}:{exchange}"
-        cached = _QUOTE_CACHE.get(cache_key)
-        if cached and now - cached[0] < _QUOTE_CACHE_TTL_SECONDS:
-            quotes[symbol] = cached[1]
+        cached = _QUOTE_CACHE.get(f"{symbol}:{exchange}")
+        if cached is not None:
+            quotes[symbol] = cached
         else:
             need_fetch.append(symbol)
 
     if need_fetch:
         fetched = _bulk_fetch_quotes(need_fetch, exchange)
         for symbol, quote in fetched.items():
-            _QUOTE_CACHE[f"{symbol}:{exchange}"] = (now, quote)
+            _QUOTE_CACHE.set(f"{symbol}:{exchange}", quote)
             quotes[symbol] = quote
 
     return [quotes[s] for s in symbols if s in quotes]

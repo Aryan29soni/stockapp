@@ -14,8 +14,6 @@ crystal ball - it has no notion of news, earnings, or macro events. The API
 response always carries a disclaimer.
 """
 
-import time
-
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
@@ -23,6 +21,7 @@ from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
 from . import fundamentals as fundamentals_module
 from . import indicators as ind
 from . import macro as macro_module
+from .cache import TTLCache
 
 DISCLAIMER = (
     "This forecast comes from a small ensemble of machine-learning models "
@@ -65,11 +64,12 @@ MIN_TRAIN_ROWS = 60
 RANDOM_STATE = 42
 N_BACKTEST_FOLDS = 3
 
-_FORECAST_CACHE: dict[str, tuple[float, dict]] = {}
-_FORECAST_CACHE_TTL_SECONDS = 60 * 15  # the analysis endpoint's signal and the
-# /predict endpoint both need this same fit; caching means switching the
-# price-history chart's period (which doesn't affect this 2y-history model)
-# or loading both sections of a stock's page doesn't retrain it twice.
+# the analysis endpoint's signal and the /predict endpoint both need this
+# same fit; caching means switching the price-history chart's period
+# (which doesn't affect this 5y-history model) or loading both sections of
+# a stock's page doesn't retrain it twice. Bounded (see cache.py) since
+# symbol x exchange x 4 horizons is a lot of distinct keys over a session.
+_FORECAST_CACHE: TTLCache[dict] = TTLCache(ttl_seconds=60 * 15, max_entries=400)
 
 
 def _build_features(
@@ -225,15 +225,14 @@ def forecast_cached(
     earnings: pd.DataFrame | None = None,
 ) -> dict:
     cache_key = f"{symbol}:{exchange}:{horizon_days}"
-    now = time.time()
     cached = _FORECAST_CACHE.get(cache_key)
-    if cached and now - cached[0] < _FORECAST_CACHE_TTL_SECONDS:
-        return cached[1]
+    if cached is not None:
+        return cached
     result = forecast(
         df, horizon_days=horizon_days, index_df=index_df,
         sector_index=sector_index, macro=macro, earnings=earnings,
     )
-    _FORECAST_CACHE[cache_key] = (now, result)
+    _FORECAST_CACHE.set(cache_key, result)
     return result
 
 

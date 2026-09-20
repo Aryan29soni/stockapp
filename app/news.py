@@ -22,7 +22,6 @@ is a real, independently-validated NLU sentiment model, not a hand-rolled
 keyword count. The API response always carries a disclaimer.
 """
 
-import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
@@ -31,6 +30,7 @@ import yfinance as yf
 from . import sentiment as sentiment_module
 from . import signals as signals_module
 from . import stocks as stocks_module
+from .cache import TTLCache
 from .data import _yf_symbol
 
 DISCLAIMER = (
@@ -43,9 +43,10 @@ DISCLAIMER = (
     "This feed refreshes automatically roughly every 10 minutes."
 )
 
-_NEWS_CACHE: dict[str, tuple[float, list[dict], str]] = {}
-_NEWS_CACHE_TTL_SECONDS = 60 * 10  # short enough to feel live; yfinance's own
-# feed doesn't update much faster than this anyway
+_NEWS_CACHE: TTLCache[tuple[list[dict], str]] = TTLCache(ttl_seconds=60 * 10, max_entries=10)
+# short TTL so it feels live; yfinance's own feed doesn't update much faster
+# than this anyway. Only ever 2 real keys (NSE/BSE) so size isn't a growth
+# risk here, but using the same shared cache (see cache.py) for consistency.
 
 _NEWS_LOOKBACK_HOURS = 120
 _MAX_SYMBOLS_SCANNED = 150
@@ -86,10 +87,9 @@ def _fetch_one(symbol: str, exchange: str) -> tuple[str, list[dict]]:
 
 def get_news_feed(limit: int = 20, exchange: str = "NSE") -> dict:
     cache_key = f"NEWS:{exchange}"
-    now = time.time()
     cached = _NEWS_CACHE.get(cache_key)
-    if cached and now - cached[0] < _NEWS_CACHE_TTL_SECONDS:
-        items, generated_at = cached[1], cached[2]
+    if cached is not None:
+        items, generated_at = cached
     else:
         symbols = stocks_module.POPULAR_SYMBOLS[:_MAX_SYMBOLS_SCANNED]
         with ThreadPoolExecutor(max_workers=25) as pool:
@@ -168,6 +168,6 @@ def get_news_feed(limit: int = 20, exchange: str = "NSE") -> dict:
         for it in items:
             del it["_pubDateSort"]
         generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        _NEWS_CACHE[cache_key] = (now, items, generated_at)
+        _NEWS_CACHE.set(cache_key, (items, generated_at))
 
     return {"results": items[:limit], "disclaimer": DISCLAIMER, "generatedAt": generated_at}

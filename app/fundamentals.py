@@ -12,16 +12,17 @@ surprises are the one fundamentals-adjacent data point yfinance gives us
 with real historical dates attached.
 """
 
-import time
-
 import numpy as np
 import pandas as pd
 import yfinance as yf
 
+from .cache import TTLCache
 from .data import _yf_symbol
 
-_CACHE: dict[str, tuple[float, pd.DataFrame | None]] = {}
-_CACHE_TTL_SECONDS = 60 * 60 * 6  # reported quarterly; no need to refetch often
+# reported quarterly, so no need to refetch often. "No earnings data found"
+# is itself cached as None (see cache.py's TTLCache.has()) so a symbol with
+# no data doesn't get re-fetched from yfinance on every single call.
+_CACHE: TTLCache[pd.DataFrame | None] = TTLCache(ttl_seconds=60 * 60 * 6, max_entries=1500)
 
 
 def _fetch_earnings_dates(symbol: str, exchange: str) -> pd.DataFrame | None:
@@ -42,12 +43,10 @@ def _fetch_earnings_dates(symbol: str, exchange: str) -> pd.DataFrame | None:
 
 def get_earnings_dates_cached(symbol: str, exchange: str) -> pd.DataFrame | None:
     cache_key = f"{symbol}:{exchange}"
-    now = time.time()
-    cached = _CACHE.get(cache_key)
-    if cached and now - cached[0] < _CACHE_TTL_SECONDS:
-        return cached[1]
+    if _CACHE.has(cache_key):
+        return _CACHE.get(cache_key)
     result = _fetch_earnings_dates(symbol, exchange)
-    _CACHE[cache_key] = (now, result)
+    _CACHE.set(cache_key, result)
     return result
 
 

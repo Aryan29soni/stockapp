@@ -14,13 +14,15 @@ don't get a sector-relative-strength feature (they still get the broad
 Nifty-relative and macro features).
 """
 
-import time
-
 import pandas as pd
 import yfinance as yf
 
-_CACHE: dict[str, tuple[float, pd.Series]] = {}
-_CACHE_TTL_SECONDS = 60 * 30  # these move slowly; no need to refetch often
+from .cache import TTLCache
+
+# these move slowly; no need to refetch often. Low cardinality (a handful
+# of macro/sector tickers total) so size isn't a real growth risk here,
+# but using the shared cache (see cache.py) for consistency.
+_CACHE: TTLCache[pd.Series] = TTLCache(ttl_seconds=60 * 30, max_entries=50)
 
 _MACRO_TICKERS = {
     "vix": "^INDIAVIX",
@@ -50,13 +52,12 @@ def _fetch_series(ticker: str, period: str) -> pd.Series | None:
 
 
 def _cached_series(cache_key: str, ticker: str, period: str) -> pd.Series | None:
-    now = time.time()
     cached = _CACHE.get(cache_key)
-    if cached and now - cached[0] < _CACHE_TTL_SECONDS:
-        return cached[1]
+    if cached is not None:
+        return cached
     series = _fetch_series(ticker, period)
     if series is not None:
-        _CACHE[cache_key] = (now, series)
+        _CACHE.set(cache_key, series)
     return series
 
 

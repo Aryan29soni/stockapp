@@ -2,17 +2,18 @@
 app's filter chips), computed from one batched history download rather than
 one request per symbol."""
 
-import time
 from concurrent.futures import ThreadPoolExecutor
 
 import pandas as pd
 import yfinance as yf
 
 from . import indicators as ind
+from .cache import TTLCache
 from .data import _yf_symbol  # reuse the same .NS/.BO suffix logic
 
-_SIGNAL_CACHE: dict[str, tuple[float, dict]] = {}
-_SIGNAL_CACHE_TTL_SECONDS = 60 * 15  # signals only move once per trading day
+# signals only move once per trading day; bounded to 1,500 since every
+# distinct symbol viewed (there are 1,400+ NSE stocks) adds a key (see cache.py).
+_SIGNAL_CACHE: TTLCache[dict] = TTLCache(ttl_seconds=60 * 15, max_entries=1500)
 
 _CHUNK_SIZE = 75  # yfinance's bulk download scales roughly linearly with
 # symbol count even with threads=True, so splitting a big request into a few
@@ -29,15 +30,13 @@ def _download_chunk(yf_symbols: list[str]) -> pd.DataFrame:
 def get_bulk_signals(symbols: list[str], exchange: str = "NSE") -> dict[str, dict]:
     """Returns {symbol: {"signal": "BUY"|"SELL"|"HOLD", "reasons": [...]}} for
     as many of the requested symbols as have enough history."""
-    now = time.time()
     results: dict[str, dict] = {}
     need_fetch = []
 
     for symbol in symbols:
-        cache_key = f"{symbol}:{exchange}"
-        cached = _SIGNAL_CACHE.get(cache_key)
-        if cached and now - cached[0] < _SIGNAL_CACHE_TTL_SECONDS:
-            results[symbol] = cached[1]
+        cached = _SIGNAL_CACHE.get(f"{symbol}:{exchange}")
+        if cached is not None:
+            results[symbol] = cached
         else:
             need_fetch.append(symbol)
 
@@ -68,7 +67,7 @@ def get_bulk_signals(symbols: list[str], exchange: str = "NSE") -> dict[str, dic
                     continue
                 computed = ind.compute_indicators(sub)
                 entry = {"signal": computed["signal"], "reasons": computed["reasons"]}
-                _SIGNAL_CACHE[f"{symbol}:{exchange}"] = (now, entry)
+                _SIGNAL_CACHE.set(f"{symbol}:{exchange}", entry)
                 results[symbol] = entry
             except (KeyError, ValueError):
                 continue
