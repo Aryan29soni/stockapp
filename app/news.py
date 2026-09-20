@@ -139,7 +139,8 @@ def get_news_feed(limit: int = 20, exchange: str = "NSE") -> dict:
             latest = articles[0]
             aggregate_score = sum(a["score"] for a in articles)
             news_lean = _news_lean(aggregate_score)
-            technical_signal = (technical_signals.get(symbol) or {}).get("signal")
+            technical_entry = technical_signals.get(symbol) or {}
+            technical_signal = technical_entry.get("signal")
             combined_tilt, confidence, rationale = _combine(news_lean, technical_signal)
 
             summary = latest["summary"]
@@ -157,6 +158,22 @@ def get_news_feed(limit: int = 20, exchange: str = "NSE") -> dict:
                     "sentimentScore": aggregate_score,
                     "newsLean": news_lean,
                     "technicalSignal": technical_signal,
+                    # The specific indicator readings behind the technical
+                    # call (e.g. "RSI indicates oversold conditions") - same
+                    # list the single-stock page already shows, so the "why"
+                    # here is a real reason, not just a restated label.
+                    "technicalReasons": technical_entry.get("reasons", []),
+                    # Per-article tone, so "why" for the news lean can point
+                    # at which specific headlines drove it rather than just
+                    # restating the aggregate score.
+                    "newsBreakdown": [
+                        {
+                            "headline": a["title"],
+                            "source": a["source"],
+                            "sentiment": sentiment_module.sentiment_label(a["score"]),
+                        }
+                        for a in articles
+                    ],
                     "combinedTilt": combined_tilt,
                     "confidence": confidence,
                     "rationale": rationale,

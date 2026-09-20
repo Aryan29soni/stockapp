@@ -14,6 +14,8 @@ crystal ball - it has no notion of news, earnings, or macro events. The API
 response always carries a disclaimer.
 """
 
+import threading
+
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
@@ -22,6 +24,18 @@ from . import fundamentals as fundamentals_module
 from . import indicators as ind
 from . import macro as macro_module
 from .cache import TTLCache
+
+# Each forecast trains 2 sklearn models x 4 times (3 backtest folds + 1 final
+# refit) - real CPU/memory work, not just a lookup. On Render's free tier
+# (a fraction of one shared CPU, 512MB RAM), several of these running at once
+# - e.g. a user opening a few stocks in a row while the cache is cold - was
+# almost certainly what actually caused the repeated OOM kills, not any
+# single request's cost alone. This serializes training system-wide so at
+# most one fit runs at a time; everything else just waits its turn instead of
+# piling up concurrently. A timed-out waiter falls back to the cheap
+# trend-line estimate rather than hanging forever.
+_TRAINING_LOCK = threading.Semaphore(1)
+_TRAINING_LOCK_TIMEOUT_SECONDS = 25
 
 DISCLAIMER = (
     "This forecast comes from a small ensemble of machine-learning models "
@@ -286,24 +300,29 @@ def _ml_forecast(
     X = data[feature_cols].to_numpy()
     y = data["target"].to_numpy()
 
-    backtest = _walk_forward_backtest(X, y)
-    if backtest is None:
-        return None
-    test_preds, test_actuals = backtest
-
-    errors = test_preds - test_actuals
-    mae = float(np.mean(np.abs(errors)))
-    directional_accuracy = float(np.mean(np.sign(test_preds) == np.sign(test_actuals)))
-    err_low, err_high = (float(v) for v in np.percentile(errors, [10, 90]))
-
     latest_row = features.iloc[[-1]][feature_cols].to_numpy()
     if np.isnan(latest_row).any():
         return None
 
-    # Final ensemble refit on all labeled data (including backtest folds) for
-    # the live forecast itself - backtest accuracy above was measured on
-    # models that never saw their own test fold.
-    predicted_return = float(_ensemble_fit_predict(X, y, latest_row)[0])
+    if not _TRAINING_LOCK.acquire(timeout=_TRAINING_LOCK_TIMEOUT_SECONDS):
+        return None  # too much concurrent demand right now - caller falls back to the trend estimate
+    try:
+        backtest = _walk_forward_backtest(X, y)
+        if backtest is None:
+            return None
+        test_preds, test_actuals = backtest
+
+        errors = test_preds - test_actuals
+        mae = float(np.mean(np.abs(errors)))
+        directional_accuracy = float(np.mean(np.sign(test_preds) == np.sign(test_actuals)))
+        err_low, err_high = (float(v) for v in np.percentile(errors, [10, 90]))
+
+        # Final ensemble refit on all labeled data (including backtest folds)
+        # for the live forecast itself - backtest accuracy above was measured
+        # on models that never saw their own test fold.
+        predicted_return = float(_ensemble_fit_predict(X, y, latest_row)[0])
+    finally:
+        _TRAINING_LOCK.release()
 
     last_close = float(close.iloc[-1])
     last_date = df.index[-1]
